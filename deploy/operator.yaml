@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openshift-cert-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: openshift-cert-controller
+  template:
+    metadata:
+      labels:
+        name: openshift-cert-controller
+    spec:
+      serviceAccountName: openshift-cert-controller
+      containers:
+        - name: openshift-cert-controller
+          # Replace this with the built image name
+          image: REPLACE_IMAGE
+          command:
+          - openshift-cert-controller
+          imagePullPolicy: Always
+          env:
+            - name: WATCH_NAMESPACE
+              value: ""
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: OPERATOR_NAME
+              value: "openshift-cert-controller"
