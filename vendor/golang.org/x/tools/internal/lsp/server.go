@@ -69,8 +69,10 @@ type server struct {
 	signatureHelpEnabled bool
 	snippetsSupported    bool
 
+	textDocumentSyncKind protocol.TextDocumentSyncKind
+
 	viewMu sync.Mutex
-	view   source.View
+	view   *cache.View
 }
 
 func (s *server) Initialize(ctx context.Context, params *protocol.InitializeParams) (*protocol.InitializeResult, error) {
@@ -82,12 +84,15 @@ func (s *server) Initialize(ctx context.Context, params *protocol.InitializePara
 	s.initialized = true // mark server as initialized now
 
 	// Check if the client supports snippets in completion items.
-	s.snippetsSupported = params.Capabilities.TextDocument.Completion.CompletionItem.SnippetSupport
+	capText := params.Capabilities.InnerClientCapabilities.TextDocument
+	if capText != nil && capText.Completion != nil && capText.Completion.CompletionItem != nil {
+		s.snippetsSupported = capText.Completion.CompletionItem.SnippetSupport
+	}
 	s.signatureHelpEnabled = true
 
-	var rootURI protocol.DocumentURI
-	if params.RootURI != nil {
-		rootURI = *params.RootURI
+	var rootURI string
+	if params.RootURI != "" {
+		rootURI = params.RootURI
 	}
 	sourceURI, err := fromProtocolURI(rootURI)
 	if err != nil {
@@ -97,6 +102,10 @@ func (s *server) Initialize(ctx context.Context, params *protocol.InitializePara
 	if err != nil {
 		return nil, err
 	}
+
+	// TODO(rstambler): Change this default to protocol.Incremental (or add a
+	// flag). Disabled for now to simplify debugging.
+	s.textDocumentSyncKind = protocol.Full
 
 	s.view = cache.NewView(&packages.Config{
 		Context: ctx,
@@ -112,22 +121,26 @@ func (s *server) Initialize(ctx context.Context, params *protocol.InitializePara
 
 	return &protocol.InitializeResult{
 		Capabilities: protocol.ServerCapabilities{
-			CodeActionProvider: true,
-			CompletionProvider: protocol.CompletionOptions{
-				TriggerCharacters: []string{"."},
+			InnerServerCapabilities: protocol.InnerServerCapabilities{
+				CodeActionProvider: true,
+				CompletionProvider: &protocol.CompletionOptions{
+					TriggerCharacters: []string{"."},
+				},
+				DefinitionProvider:              true,
+				DocumentFormattingProvider:      true,
+				DocumentRangeFormattingProvider: true,
+				HoverProvider:                   true,
+				SignatureHelpProvider: &protocol.SignatureHelpOptions{
+					TriggerCharacters: []string{"(", ","},
+				},
+				TextDocumentSync: &protocol.TextDocumentSyncOptions{
+					Change:    s.textDocumentSyncKind,
+					OpenClose: true,
+				},
 			},
-			DefinitionProvider:              true,
-			DocumentFormattingProvider:      true,
-			DocumentRangeFormattingProvider: true,
-			HoverProvider:                   true,
-			SignatureHelpProvider: protocol.SignatureHelpOptions{
-				TriggerCharacters: []string{"(", ","},
+			TypeDefinitionServerCapabilities: protocol.TypeDefinitionServerCapabilities{
+				TypeDefinitionProvider: true,
 			},
-			TextDocumentSync: protocol.TextDocumentSyncOptions{
-				Change:    float64(protocol.Incremental),
-				OpenClose: true,
-			},
-			TypeDefinitionProvider: true,
 		},
 	}, nil
 }
@@ -182,10 +195,14 @@ func (s *server) DidOpen(ctx context.Context, params *protocol.DidOpenTextDocume
 func bytesOffset(content []byte, pos protocol.Position) int {
 	var line, char, offset int
 
-	for len(content) > 0 {
+	for {
 		if line == int(pos.Line) && char == int(pos.Character) {
 			return offset
 		}
+		if len(content) == 0 {
+			return -1
+		}
+
 		r, size := utf8.DecodeRune(content)
 		char++
 		// The offsets are based on a UTF-16 string representation.
@@ -203,7 +220,6 @@ func bytesOffset(content []byte, pos protocol.Position) int {
 			char = 0
 		}
 	}
-	return -1
 }
 
 func (s *server) applyChanges(ctx context.Context, params *protocol.DidChangeTextDocumentParams) (string, error) {
@@ -226,7 +242,7 @@ func (s *server) applyChanges(ctx context.Context, params *protocol.DidChangeTex
 		return "", jsonrpc2.NewErrorf(jsonrpc2.CodeInternalError, "file not found")
 	}
 
-	content := file.GetContent()
+	content := file.GetContent(ctx)
 	for _, change := range params.ContentChanges {
 		start := bytesOffset(content, change.Range.Start)
 		if start == -1 {
@@ -250,9 +266,21 @@ func (s *server) DidChange(ctx context.Context, params *protocol.DidChangeTextDo
 		return jsonrpc2.NewErrorf(jsonrpc2.CodeInternalError, "no content changes provided")
 	}
 
-	text, err := s.applyChanges(ctx, params)
-	if err != nil {
-		return err
+	var text string
+	switch s.textDocumentSyncKind {
+	case protocol.Incremental:
+		var err error
+		text, err = s.applyChanges(ctx, params)
+		if err != nil {
+			return err
+		}
+	case protocol.Full:
+		// We expect the full content of file, i.e. a single change with no range.
+		change := params.ContentChanges[0]
+		if change.RangeLength != 0 {
+			return jsonrpc2.NewErrorf(jsonrpc2.CodeInternalError, "unexpected change range provided")
+		}
+		text = change.Text
 	}
 	s.cacheAndDiagnose(ctx, params.TextDocument.URI, text)
 	return nil
@@ -288,7 +316,7 @@ func (s *server) Completion(ctx context.Context, params *protocol.CompletionPara
 	if err != nil {
 		return nil, err
 	}
-	tok := f.GetToken()
+	tok := f.GetToken(ctx)
 	pos := fromProtocolPosition(tok, params.Position)
 	items, prefix, err := source.Completion(ctx, f, pos)
 	if err != nil {
@@ -313,23 +341,24 @@ func (s *server) Hover(ctx context.Context, params *protocol.TextDocumentPositio
 	if err != nil {
 		return nil, err
 	}
-	tok := f.GetToken()
+	tok := f.GetToken(ctx)
 	pos := fromProtocolPosition(tok, params.Position)
 	ident, err := source.Identifier(ctx, s.view, f, pos)
 	if err != nil {
 		return nil, err
 	}
-	content, err := ident.Hover(nil)
+	content, err := ident.Hover(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	markdown := "```go\n" + content + "\n```"
+	x := toProtocolRange(tok, ident.Range)
 	return &protocol.Hover{
 		Contents: protocol.MarkupContent{
 			Kind:  protocol.Markdown,
 			Value: markdown,
 		},
-		Range: toProtocolRange(tok, ident.Range),
+		Range: &x,
 	}, nil
 }
 
@@ -342,7 +371,7 @@ func (s *server) SignatureHelp(ctx context.Context, params *protocol.TextDocumen
 	if err != nil {
 		return nil, err
 	}
-	tok := f.GetToken()
+	tok := f.GetToken(ctx)
 	pos := fromProtocolPosition(tok, params.Position)
 	info, err := source.SignatureHelp(ctx, f, pos)
 	if err != nil {
@@ -360,7 +389,7 @@ func (s *server) Definition(ctx context.Context, params *protocol.TextDocumentPo
 	if err != nil {
 		return nil, err
 	}
-	tok := f.GetToken()
+	tok := f.GetToken(ctx)
 	pos := fromProtocolPosition(tok, params.Position)
 	ident, err := source.Identifier(ctx, s.view, f, pos)
 	if err != nil {
@@ -378,7 +407,7 @@ func (s *server) TypeDefinition(ctx context.Context, params *protocol.TextDocume
 	if err != nil {
 		return nil, err
 	}
-	tok := f.GetToken()
+	tok := f.GetToken(ctx)
 	pos := fromProtocolPosition(tok, params.Position)
 	ident, err := source.Identifier(ctx, s.view, f, pos)
 	if err != nil {
@@ -412,8 +441,8 @@ func (s *server) CodeAction(ctx context.Context, params *protocol.CodeActionPara
 		{
 			Title: "Organize Imports",
 			Kind:  protocol.SourceOrganizeImports,
-			Edit: protocol.WorkspaceEdit{
-				Changes: map[protocol.DocumentURI][]protocol.TextEdit{
+			Edit: &protocol.WorkspaceEdit{
+				Changes: &map[string][]protocol.TextEdit{
 					params.TextDocument.URI: edits,
 				},
 			},
@@ -461,7 +490,7 @@ func (s *server) Rename(context.Context, *protocol.RenameParams) ([]protocol.Wor
 	return nil, notImplemented("Rename")
 }
 
-func (s *server) FoldingRanges(context.Context, *protocol.FoldingRangeRequestParam) ([]protocol.FoldingRange, error) {
+func (s *server) FoldingRanges(context.Context, *protocol.FoldingRangeParams) ([]protocol.FoldingRange, error) {
 	return nil, notImplemented("FoldingRanges")
 }
 

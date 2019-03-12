@@ -6,7 +6,8 @@ import (
 
 	routev1 "github.com/openshift/api/route/v1"
 	v1 "github.com/openshift/api/route/v1"
-	"github.com/redhat-cop/cert-operator/pkg/certs"
+	"github.com/redhat-cop/openshift-cert-controller/pkg/certs"
+	certconf "github.com/redhat-cop/openshift-cert-controller/pkg/config"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -34,13 +35,42 @@ var log = logf.Log.WithName("controller_route")
 
 // Add creates a new Route Controller and adds it to the Manager. The Manager will set fields on the Controller
 // and Start it when the Manager is Started.
-func Add(mgr manager.Manager) error {
-	return add(mgr, newReconciler(mgr))
+func Add(mgr manager.Manager, config certconf.Config) error {
+	return add(mgr, newReconciler(mgr, config))
 }
 
 // newReconciler returns a new reconcile.Reconciler
-func newReconciler(mgr manager.Manager) reconcile.Reconciler {
-	return &ReconcileRoute{client: mgr.GetClient(), scheme: mgr.GetScheme()}
+func newReconciler(mgr manager.Manager, config certconf.Config) reconcile.Reconciler {
+
+	var provider certs.Provider
+
+	if config.Provider.Ssl == "true" {
+		// logrus.Infof("SSL Verified")
+		log.Info("SSL Verified")
+	} else {
+		// logrus.Infof("SSL Not Verified")
+		log.Info("SSL Not Verified")
+	}
+
+	switch config.Provider.Kind {
+	case "none":
+		// logrus.Infof("None provider.")
+		log.Info("None provider.")
+		provider = new(certs.NoneProvider)
+	case "self-signed":
+		// logrus.Infof("Self Signed provider.")
+		log.Info("Self Signed provider.")
+		provider = new(certs.SelfSignedProvider)
+	case "venafi":
+		// logrus.Infof("Venafi Cert provider.")
+		provider = new(certs.VenafiProvider)
+	default:
+		panic("There was a problem detecting which provider to configure. \n" +
+			"\tProvider kind `" + config.Provider.Kind + "` is invalid. \n" +
+			config.String())
+	}
+
+	return &ReconcileRoute{client: mgr.GetClient(), scheme: mgr.GetScheme(), config: config, provider: provider}
 }
 
 // add adds a new Controller to mgr with r as the reconcile.Reconciler
@@ -76,8 +106,10 @@ var _ reconcile.Reconciler = &ReconcileRoute{}
 type ReconcileRoute struct {
 	// This client, initialized using mgr.Client() above, is a split client
 	// that reads objects from the cache and writes to the apiserver
-	client client.Client
-	scheme *runtime.Scheme
+	client   client.Client
+	scheme   *runtime.Scheme
+	config   certconf.Config
+	provider certs.Provider
 }
 
 // Reconcile reads that state of the cluster for a Route object and makes changes based on the state read
@@ -111,7 +143,7 @@ func (r *ReconcileRoute) Reconcile(request reconcile.Request) (reconcile.Result,
 
 	if instance.ObjectMeta.Annotations["openshift.io/cert-ctl-status"] == "new" {
 		// Retreive cert from provider
-		keyPair, err := getCert(instance.Spec.Host)
+		keyPair, err := r.getCert(instance.Spec.Host)
 		var routeCopy *v1.Route
 		routeCopy = instance.DeepCopy()
 		routeCopy.ObjectMeta.Annotations["openshift.io/cert-ctl-status"] = "no"
@@ -133,7 +165,7 @@ func (r *ReconcileRoute) Reconcile(request reconcile.Request) (reconcile.Result,
 			Key:         string(keyPair.Key),
 		}
 
-		err = updateRoute(routeCopy)
+		err = r.updateRoute(routeCopy)
 		if err != nil {
 			return reconcile.Result{}, err
 		}
@@ -169,17 +201,17 @@ func newPodForCR(cr *routev1.Route) *corev1.Pod {
 	}
 }
 
-func getCert(host string) (certs.KeyPair, error) {
+func (r *ReconcileRoute) getCert(host string) (certs.KeyPair, error) {
 	oneYear, timeErr := time.ParseDuration("8760h")
 	if timeErr != nil {
 		return certs.KeyPair{}, timeErr
 	}
 
 	// Retreive cert from provider
-	keyPair, err := h.provider.Provision(
+	keyPair, err := r.provider.Provision(
 		host,
 		time.Now().Format(timeFormat),
-		oneYear, false, 2048, "", h.config.Provider.Ssl)
+		oneYear, false, 2048, "", r.config.Provider.Ssl)
 	if err != nil {
 		return certs.KeyPair{}, err
 	}
@@ -187,9 +219,9 @@ func getCert(host string) (certs.KeyPair, error) {
 }
 
 // update route def
-func updateRoute(route *v1.Route) error {
+func (r *ReconcileRoute) updateRoute(route *v1.Route) error {
 
-	err := sdk.Update(route)
+	err := r.client.Update(context.TODO(), route)
 
 	return err
 }

@@ -7,7 +7,7 @@ notifiers:
   integration_url: https://hooks.slack.com/services/service_id/auth-token
 */
 
-package stub
+package config
 
 import (
 	"encoding/json"
@@ -18,7 +18,7 @@ import (
 	"github.com/micro/go-config/source/file"
 	"github.com/micro/go-config/source/flag"
 	"github.com/micro/go-config/source/memory"
-	"github.com/redhat-cop/cert-operator/pkg/certs"
+	"github.com/redhat-cop/openshift-cert-controller/pkg/certs"
 	"github.com/sirupsen/logrus"
 )
 

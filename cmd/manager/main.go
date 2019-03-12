@@ -8,7 +8,8 @@ import (
 	"runtime"
 
 	"github.com/redhat-cop/openshift-cert-controller/pkg/apis"
-	"github.com/redhat-cop/openshift-cert-controller/pkg/controller"
+	certconf "github.com/redhat-cop/openshift-cert-controller/pkg/config"
+	"github.com/redhat-cop/openshift-cert-controller/pkg/controller/route"
 
 	routev1 "github.com/openshift/api/route/v1"
 	"github.com/operator-framework/operator-sdk/pkg/k8sutil"
@@ -73,6 +74,9 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Load Config
+	conf := certconf.NewConfig()
+
 	ctx := context.TODO()
 
 	// Become the leader before proceeding
@@ -106,15 +110,20 @@ func main() {
 	}
 
 	// Setup all Controllers
-	if err = controller.AddToManager(mgr); err != nil {
-		log.Error(err, "")
-		os.Exit(1)
-	}
+	//	if err = controller.AddToManager(mgr); err != nil {
+	//		log.Error(err, "")
+	//		os.Exit(1)
+	//	}
 
 	// Create Service object to expose the metrics port.
 	_, err = metrics.ExposeMetricsPort(ctx, metricsPort)
 	if err != nil {
 		log.Info(err.Error())
+	}
+
+	// setup Jenkins controller
+	if err := route.Add(mgr, conf); err != nil {
+		log.Error(err, "failed to setup controllers")
 	}
 
 	log.Info("Starting the Cmd.")

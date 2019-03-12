@@ -41,23 +41,31 @@ import (
 
 type Diagnostic struct {
 	Range
-	Message string
-	Source  string
+	Message  string
+	Source   string
+	Severity DiagnosticSeverity
 }
+
+type DiagnosticSeverity int
+
+const (
+	SeverityWarning DiagnosticSeverity = iota
+	SeverityError
+)
 
 func Diagnostics(ctx context.Context, v View, uri URI) (map[string][]Diagnostic, error) {
 	f, err := v.GetFile(ctx, uri)
 	if err != nil {
 		return nil, err
 	}
-	pkg := f.GetPackage()
+	pkg := f.GetPackage(ctx)
 	// Prepare the reports we will send for this package.
 	reports := make(map[string][]Diagnostic)
-	for _, filename := range pkg.GoFiles {
+	for _, filename := range pkg.GetFilenames() {
 		reports[filename] = []Diagnostic{}
 	}
 	var parseErrors, typeErrors []packages.Error
-	for _, err := range pkg.Errors {
+	for _, err := range pkg.GetErrors() {
 		switch err.Kind {
 		case packages.ParseError:
 			parseErrors = append(parseErrors, err)
@@ -79,8 +87,8 @@ func Diagnostics(ctx context.Context, v View, uri URI) (map[string][]Diagnostic,
 		if err != nil {
 			continue
 		}
-		diagTok := diagFile.GetToken()
-		end, err := identifierEnd(diagFile.GetContent(), pos.Line, pos.Column)
+		diagTok := diagFile.GetToken(ctx)
+		end, err := identifierEnd(diagFile.GetContent(ctx), pos.Line, pos.Column)
 		// Don't set a range if it's anything other than a type error.
 		if err != nil || diag.Kind != packages.TypeError {
 			end = 0
@@ -98,7 +106,8 @@ func Diagnostics(ctx context.Context, v View, uri URI) (map[string][]Diagnostic,
 				Start: startPos,
 				End:   endPos,
 			},
-			Message: diag.Msg,
+			Message:  diag.Msg,
+			Severity: SeverityError,
 		}
 		if _, ok := reports[pos.Filename]; ok {
 			reports[pos.Filename] = append(reports[pos.Filename], diagnostic)
@@ -108,17 +117,17 @@ func Diagnostics(ctx context.Context, v View, uri URI) (map[string][]Diagnostic,
 		return reports, nil
 	}
 	// Type checking and parsing succeeded. Run analyses.
-	runAnalyses(v.GetAnalysisCache(), pkg, func(a *analysis.Analyzer, diag analysis.Diagnostic) {
-		pos := pkg.Fset.Position(diag.Pos)
+	runAnalyses(ctx, v, pkg, func(a *analysis.Analyzer, diag analysis.Diagnostic) {
+		pos := v.FileSet().Position(diag.Pos)
 		category := a.Name
 		if diag.Category != "" {
 			category += "." + category
 		}
-
 		reports[pos.Filename] = append(reports[pos.Filename], Diagnostic{
-			Source:  category,
-			Range:   Range{Start: diag.Pos, End: diag.Pos},
-			Message: fmt.Sprintf(diag.Message),
+			Source:   category,
+			Range:    Range{Start: diag.Pos, End: diag.Pos},
+			Message:  fmt.Sprintf(diag.Message),
+			Severity: SeverityWarning,
 		})
 	})
 
@@ -176,7 +185,7 @@ func identifierEnd(content []byte, l, c int) (int, error) {
 	return bytes.IndexAny(line[c-1:], " \n,():;[]"), nil
 }
 
-func runAnalyses(c *AnalysisCache, pkg *packages.Package, report func(a *analysis.Analyzer, diag analysis.Diagnostic)) error {
+func runAnalyses(ctx context.Context, v View, pkg Package, report func(a *analysis.Analyzer, diag analysis.Diagnostic)) error {
 	// the traditional vet suite:
 	analyzers := []*analysis.Analyzer{
 		asmdecl.Analyzer,
@@ -203,7 +212,7 @@ func runAnalyses(c *AnalysisCache, pkg *packages.Package, report func(a *analysi
 		unusedresult.Analyzer,
 	}
 
-	roots := c.analyze([]*packages.Package{pkg}, analyzers)
+	roots := analyze(ctx, v, []Package{pkg}, analyzers)
 
 	// Report diagnostics and errors from root analyzers.
 	for _, r := range roots {
@@ -213,7 +222,7 @@ func runAnalyses(c *AnalysisCache, pkg *packages.Package, report func(a *analysi
 				// which isn't super useful...
 				return r.err
 			}
-			report(r.a, diag)
+			report(r.Analyzer, diag)
 		}
 	}
 
